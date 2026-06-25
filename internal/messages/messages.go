@@ -21,3 +21,14 @@ type HintsMsg struct {
 	Hints []IndexHint
 	Err   error
 }
+
+type ColumnInfo struct {
+	Name string
+	Type string
+}
+
+type FieldDiscoveryMsg struct {
+	Index   string
+	Columns []ColumnInfo
+	Err     error
+}

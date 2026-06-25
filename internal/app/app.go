@@ -9,6 +9,7 @@ import (
 	"github.com/charmbracelet/bubbles/spinner"
 	"github.com/charmbracelet/bubbles/table"
 	"github.com/charmbracelet/bubbles/textarea"
+	"github.com/charmbracelet/bubbles/textinput"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -35,31 +36,51 @@ const (
 const editorHeight = 8
 const recordHeaderLines = 2 // header + blank line before fields
 
+type optionField int
+
+const (
+	optionLimit optionField = iota
+	optionSort
+	optionOrder
+)
+
 type recordField struct {
 	name string
 	val  string
 }
 
+var timePresets = []int{1, 5, 15, 30, 60}
+
 type Model struct {
-	client         *elasticsearch.TypedClient
-	state          appState
-	editor         textarea.Model
-	table          table.Model
-	record         viewport.Model
-	spinner        spinner.Model
-	styles         *appStyles
-	err            error
-	cancelFn       context.CancelFunc
-	hints          []messages.IndexHint
-	viewMode       viewMode
-	allColumns     []string
-	allRows        [][]string
-	recordFields   []recordField
-	recordCursor   int
-	selectedFields map[string]bool
-	rowCount       int
-	width          int
-	height         int
+	client            *elasticsearch.TypedClient
+	state             appState
+	editor            textarea.Model
+	table             table.Model
+	record            viewport.Model
+	spinner           spinner.Model
+	styles            *appStyles
+	err               error
+	cancelFn          context.CancelFunc
+	hints             []messages.IndexHint
+	indexFields       map[string][]messages.ColumnInfo
+	hintSuggestions   []suggestion
+	selectedHintIndex int // -1 = none
+	viewMode          viewMode
+	allColumns        []string
+	allRows           [][]string
+	recordFields      []recordField
+	recordCursor      int
+	selectedFields    map[string]bool
+	limitInput        textinput.Model
+	sortInput         textinput.Model
+	sortOrder         string
+	optFocused        bool
+	activeOption      optionField
+	timeIdx           int  // index into timePresets
+	timeFocused       bool
+	rowCount          int
+	width             int
+	height            int
 }
 
 func New(client *elasticsearch.TypedClient) *Model {
@@ -80,15 +101,32 @@ func New(client *elasticsearch.TypedClient) *Model {
 
 	vp := viewport.New(80, 20)
 
+	li := textinput.New()
+	li.Placeholder = "100"
+	li.SetValue("100")
+	li.Width = 6
+	li.CharLimit = 7
+
+	si := textinput.New()
+	si.Placeholder = "field asc/desc"
+	si.Width = 24
+	si.CharLimit = 80
+
 	return &Model{
-		client:         client,
-		state:          stateConnecting,
-		editor:         ta,
-		table:          tbl,
-		record:         vp,
-		spinner:        sp,
-		styles:         st,
-		selectedFields: make(map[string]bool),
+		client:            client,
+		state:             stateConnecting,
+		editor:            ta,
+		table:             tbl,
+		record:            vp,
+		spinner:           sp,
+		styles:            st,
+		selectedFields:    make(map[string]bool),
+		indexFields:       make(map[string][]messages.ColumnInfo),
+		selectedHintIndex: -1,
+		limitInput:        li,
+		sortInput:         si,
+		sortOrder:         "DESC",
+		timeIdx:           2, // default: 15 minutes
 	}
 }
 
@@ -113,7 +151,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case msg.Type == tea.KeyCtrlC:
 			return m, tea.Quit
 
-		case msg.String() == "q" && m.state == stateReady && !m.editor.Focused() && m.viewMode == viewModeTable:
+		case msg.String() == "q" && m.state == stateReady && !m.editor.Focused() && !m.optFocused && m.viewMode == viewModeTable:
 			return m, tea.Quit
 
 		case msg.Type == tea.KeyEsc && m.state == stateRunning:
@@ -183,17 +221,75 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.record.GotoTop()
 			return m, nil
 
+		case (msg.Type == tea.KeyLeft || msg.String() == "h") && m.timeFocused:
+			if m.timeIdx > 0 {
+				m.timeIdx--
+			}
+			return m, nil
+
+		case (msg.Type == tea.KeyRight || msg.String() == "l") && m.timeFocused:
+			if m.timeIdx < len(timePresets)-1 {
+				m.timeIdx++
+			}
+			return m, nil
+
+		case m.timeFocused && msg.String() >= "1" && msg.String() <= "5":
+			idx := int(msg.String()[0]-'1')
+			if idx < len(timePresets) {
+				m.timeIdx = idx
+			}
+			return m, nil
+
+		case (msg.Type == tea.KeyEsc || msg.Type == tea.KeyEnter) && m.timeFocused:
+			m.timeFocused = false
+			m.editor.Focus()
+			return m, nil
+
+		case msg.Type == tea.KeyEsc && m.optFocused:
+			m.optFocused = false
+			m.limitInput.Blur()
+			m.sortInput.Blur()
+			m.editor.Focus()
+			return m, nil
+
+		case msg.String() == " " && m.optFocused && m.activeOption == optionOrder:
+			if m.sortOrder == "DESC" {
+				m.sortOrder = "ASC"
+			} else {
+				m.sortOrder = "DESC"
+			}
+			return m, nil
+
 		case msg.Type == tea.KeyTab:
-			if m.viewMode == viewModeRecord {
+			switch {
+			case m.viewMode == viewModeRecord:
 				m.viewMode = viewModeTable
 				m.table.Blur()
 				m.editor.Focus()
-			} else if m.editor.Focused() {
-				m.editor.Blur()
-				m.table.Focus()
-			} else {
-				m.table.Blur()
+			case m.timeFocused:
+				m.timeFocused = false
 				m.editor.Focus()
+			case m.editor.Focused():
+				m.editor.Blur()
+				m.optFocused = true
+				m.activeOption = optionLimit
+				return m, m.limitInput.Focus()
+			case m.optFocused:
+				switch m.activeOption {
+				case optionLimit:
+					m.limitInput.Blur()
+					m.activeOption = optionSort
+					return m, m.sortInput.Focus()
+				case optionSort:
+					m.sortInput.Blur()
+					m.activeOption = optionOrder
+				case optionOrder:
+					m.optFocused = false
+					m.table.Focus()
+				}
+			default:
+				m.table.Blur()
+				m.timeFocused = true
 			}
 			return m, nil
 
@@ -203,9 +299,22 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 
 		default:
+			if m.state == stateReady && !m.editor.Focused() {
+				// a–d load a suggestion from the expanded index
+				if idx := letterKey(msg.String()); idx >= 0 && idx < len(m.hintSuggestions) {
+					m.editor.SetValue(m.hintSuggestions[idx].query)
+					m.editor.CursorEnd()
+					m.editor.Focus()
+					m.table.Blur()
+					return m, nil
+				}
+			}
 			if m.state == stateReady && m.editor.Focused() && strings.TrimSpace(m.editor.Value()) == "" {
 				if idx := digitKey(msg.String()); idx >= 1 && idx <= len(m.hints) {
-					q := hintQuery(m.hints[idx-1].Index)
+					h := m.hints[idx-1]
+					m.selectedHintIndex = idx - 1
+					m.hintSuggestions = suggestionsFor(h.Index, m.indexFields[h.Index])
+					q := hintQuery(h.Index)
 					m.editor.SetValue(q)
 					m.editor.CursorEnd()
 					return m, nil
@@ -232,6 +341,23 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case messages.HintsMsg:
 		if msg.Err == nil {
 			m.hints = msg.Hints
+			// fire field discovery for every hinted index concurrently
+			cmds := make([]tea.Cmd, len(msg.Hints))
+			for i, h := range msg.Hints {
+				cmds[i] = discoverFields(context.Background(), m.client, h.Index)
+			}
+			return m, tea.Batch(cmds...)
+		}
+		return m, nil
+
+	case messages.FieldDiscoveryMsg:
+		if msg.Err == nil {
+			m.indexFields[msg.Index] = msg.Columns
+			// refresh suggestions if this index is already selected
+			if m.selectedHintIndex >= 0 && m.selectedHintIndex < len(m.hints) &&
+				m.hints[m.selectedHintIndex].Index == msg.Index {
+				m.hintSuggestions = suggestionsFor(msg.Index, msg.Columns)
+			}
 		}
 		return m, nil
 
@@ -239,6 +365,8 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.state = stateReady
 		m.viewMode = viewModeTable
 		m.cancelFn = nil
+		m.hintSuggestions = nil
+		m.selectedHintIndex = -1
 		if msg.Err != nil {
 			m.err = msg.Err
 		} else {
@@ -254,8 +382,18 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		var cmd tea.Cmd
 		m.editor, cmd = m.editor.Update(msg)
 		cmds = append(cmds, cmd)
+	} else if m.optFocused {
+		switch m.activeOption {
+		case optionLimit:
+			var cmd tea.Cmd
+			m.limitInput, cmd = m.limitInput.Update(msg)
+			cmds = append(cmds, cmd)
+		case optionSort:
+			var cmd tea.Cmd
+			m.sortInput, cmd = m.sortInput.Update(msg)
+			cmds = append(cmds, cmd)
+		}
 	} else if m.viewMode == viewModeRecord {
-		// only pass page-up/down through to the viewport; cursor keys handled above
 		var cmd tea.Cmd
 		m.record, cmd = m.record.Update(msg)
 		cmds = append(cmds, cmd)
@@ -339,8 +477,50 @@ func formatWhereClause(field, val string) string {
 
 // --- query execution ---
 
+func (m *Model) buildFinalQuery() string {
+	raw := strings.TrimRight(m.editor.Value(), " \n\t")
+
+	// Strip any existing @timestamp WHERE lines so the time picker controls them
+	var stripped []string
+	for _, line := range strings.Split(raw, "\n") {
+		trimmed := strings.TrimSpace(line)
+		upper := strings.ToUpper(trimmed)
+		if strings.HasPrefix(upper, "| WHERE") && strings.Contains(trimmed, "@timestamp") {
+			continue
+		}
+		stripped = append(stripped, line)
+	}
+
+	// Insert time filter immediately after the FROM line
+	mins := timePresets[m.timeIdx]
+	timeClause := fmt.Sprintf("| WHERE @timestamp >= NOW() - %d minutes", mins)
+	var result []string
+	inserted := false
+	for _, line := range stripped {
+		result = append(result, line)
+		if !inserted && strings.HasPrefix(strings.ToUpper(strings.TrimSpace(line)), "FROM") {
+			result = append(result, timeClause)
+			inserted = true
+		}
+	}
+	if !inserted && len(result) > 0 {
+		result = append(result, timeClause)
+	}
+
+	q := strings.Join(result, "\n")
+	sort := strings.TrimSpace(m.sortInput.Value())
+	if sort != "" {
+		q += "\n| SORT " + sort + " " + m.sortOrder
+	}
+	limit := strings.TrimSpace(m.limitInput.Value())
+	if n, err := strconv.Atoi(limit); err == nil && n > 0 {
+		q += fmt.Sprintf("\n| LIMIT %d", n)
+	}
+	return q
+}
+
 func (m *Model) startQuery() tea.Cmd {
-	q := strings.TrimSpace(m.editor.Value())
+	q := strings.TrimSpace(m.buildFinalQuery())
 	if q == "" {
 		return nil
 	}
@@ -488,10 +668,29 @@ func (m *Model) buildRecordContent() string {
 
 // --- layout ---
 
+func (m *Model) optionsView() string {
+	limitLabel := m.styles.optLabel.Render("Limit:")
+	sortLabel := m.styles.optLabel.Render("Sort:")
+
+	var orderStr string
+	if m.optFocused && m.activeOption == optionOrder {
+		orderStr = m.styles.optActive.Render(" " + m.sortOrder + " [Space] ")
+	} else {
+		orderStr = m.styles.optValue.Render(" " + m.sortOrder + " ")
+	}
+
+	line := " " + limitLabel + " " + m.limitInput.View() +
+		"   " + sortLabel + " " + m.sortInput.View() +
+		"   " + m.styles.optLabel.Render("Order:") + orderStr
+
+	return m.styles.optBar.Width(m.width).Render(line)
+}
+
 func (m *Model) resizeComponents() {
 	m.editor.SetWidth(m.width - m.styles.editorBox.GetHorizontalFrameSize())
 
-	bodyHeight := m.height - editorHeight - m.styles.editorBox.GetVerticalFrameSize() - 2
+	// -4: time bar (1) + status bar (1) + options bar (1) + editor frame (1 extra for borders)
+	bodyHeight := m.height - editorHeight - m.styles.editorBox.GetVerticalFrameSize() - 4
 	if bodyHeight < 3 {
 		bodyHeight = 3
 	}
@@ -506,7 +705,9 @@ func (m *Model) View() string {
 		return "Loading…"
 	}
 
+	timeBar := m.timeBarView()
 	editorView := m.styles.editorBox.Render(m.editor.View())
+	options := m.optionsView()
 	status := m.statusLine()
 
 	var body string
@@ -529,7 +730,7 @@ func (m *Model) View() string {
 		}
 	}
 
-	return lipgloss.JoinVertical(lipgloss.Left, editorView, status, body)
+	return lipgloss.JoinVertical(lipgloss.Left, timeBar, editorView, options, status, body)
 }
 
 func (m *Model) hintsView() string {
@@ -537,9 +738,24 @@ func (m *Model) hintsView() string {
 	sb.WriteString(m.styles.hintHeader.Render("Active indices — last 15 minutes (press 1–9 to load)"))
 	sb.WriteByte('\n')
 	for i, h := range m.hints {
-		label := fmt.Sprintf("  [%d] %-50s %s events", i+1, h.Index, h.Count)
-		sb.WriteString(m.styles.hintRow.Render(label))
+		label := fmt.Sprintf("  [%d] %-55s %s events", i+1, h.Index, h.Count)
+		if i == m.selectedHintIndex {
+			sb.WriteString(m.styles.hintRowSelected.Render(label))
+		} else {
+			sb.WriteString(m.styles.hintRow.Render(label))
+		}
 		sb.WriteByte('\n')
+
+		if i == m.selectedHintIndex && len(m.hintSuggestions) > 0 {
+			sb.WriteString(m.styles.hintSugHeader.Render("       Suggested aggregations (press a–d to load):"))
+			sb.WriteByte('\n')
+			for j, s := range m.hintSuggestions {
+				key := string(rune('a' + j))
+				line := fmt.Sprintf("         [%s] %s", key, s.label)
+				sb.WriteString(m.styles.hintSugRow.Render(line))
+				sb.WriteByte('\n')
+			}
+		}
 	}
 	return sb.String()
 }
@@ -566,7 +782,13 @@ func (m *Model) statusLine() string {
 		}
 	}
 
-	if m.viewMode == viewModeRecord {
+	if m.optFocused {
+		hint := "Tab: next option  Esc: back to editor"
+		if m.activeOption == optionOrder {
+			hint = "Space: toggle ASC/DESC  Tab: next option  Esc: back to editor"
+		}
+		parts = append(parts, hint)
+	} else if m.viewMode == viewModeRecord {
 		selCount := len(m.selectedFields)
 		hint := "j/k: move  Space: select"
 		if selCount > 0 {
@@ -584,7 +806,28 @@ func (m *Model) statusLine() string {
 // --- small helpers ---
 
 func hintQuery(index string) string {
-	return fmt.Sprintf("FROM %s\n| WHERE @timestamp >= NOW() - 15 minutes\n| LIMIT 100", index)
+	return fmt.Sprintf("FROM %s", index)
+}
+
+func (m *Model) timeBarView() string {
+	var parts []string
+	for i, mins := range timePresets {
+		label := fmt.Sprintf("%dm", mins)
+		if i == m.timeIdx {
+			if m.timeFocused {
+				parts = append(parts, m.styles.timeActive.Render("●"+label))
+			} else {
+				parts = append(parts, m.styles.timeActive.Render(label))
+			}
+		} else {
+			parts = append(parts, m.styles.timeInactive.Render(label))
+		}
+	}
+	hint := ""
+	if m.timeFocused {
+		hint = "  ←/→: change  Tab/Enter: confirm"
+	}
+	return m.styles.timeBar.Width(m.width).Render("Time: " + strings.Join(parts, " ") + hint)
 }
 
 func digitKey(s string) int {
@@ -592,6 +835,14 @@ func digitKey(s string) int {
 		return int(s[0] - '0')
 	}
 	return 0
+}
+
+// letterKey maps 'a'–'d' to 0–3, returns -1 otherwise.
+func letterKey(s string) int {
+	if len(s) == 1 && s[0] >= 'a' && s[0] <= 'd' {
+		return int(s[0] - 'a')
+	}
+	return -1
 }
 
 func max(a, b int) int {

@@ -49,6 +49,28 @@ func loadHints(ctx context.Context, client *elasticsearch.TypedClient) tea.Cmd {
 	}
 }
 
+func discoverFields(ctx context.Context, client *elasticsearch.TypedClient, index string) tea.Cmd {
+	return func() tea.Msg {
+		q := fmt.Sprintf("FROM %s | WHERE @timestamp >= NOW() - 15 minutes | LIMIT 1", index)
+		raw, err := client.Esql.Query().
+			Query(q).
+			Format(esqlformat.Json).
+			Do(ctx)
+		if err != nil {
+			return messages.FieldDiscoveryMsg{Index: index, Err: err}
+		}
+		var resp esqlResponse
+		if err := json.Unmarshal(raw, &resp); err != nil {
+			return messages.FieldDiscoveryMsg{Index: index, Err: err}
+		}
+		cols := make([]messages.ColumnInfo, len(resp.Columns))
+		for i, c := range resp.Columns {
+			cols[i] = messages.ColumnInfo{Name: c.Name, Type: c.Type}
+		}
+		return messages.FieldDiscoveryMsg{Index: index, Columns: cols}
+	}
+}
+
 func ping(ctx context.Context, client *elasticsearch.TypedClient) tea.Cmd {
 	return func() tea.Msg {
 		_, err := client.Info().Do(ctx)
