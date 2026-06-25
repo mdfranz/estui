@@ -78,6 +78,7 @@ type Model struct {
 	activeOption      optionField
 	timeIdx           int  // index into timePresets
 	timeFocused       bool
+	showHints         bool
 	rowCount          int
 	width             int
 	height            int
@@ -151,8 +152,18 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case msg.Type == tea.KeyCtrlC:
 			return m, tea.Quit
 
-		case msg.String() == "q" && m.state == stateReady && !m.editor.Focused() && !m.optFocused && m.viewMode == viewModeTable:
+		case msg.String() == "q" && m.state == stateReady && !m.editor.Focused() && !m.optFocused && !m.showHints && m.viewMode == viewModeTable:
 			return m, tea.Quit
+
+		case msg.Type == tea.KeyCtrlH:
+			m.showHints = !m.showHints
+			return m, nil
+
+		case msg.Type == tea.KeyEsc && m.showHints:
+			m.showHints = false
+			m.editor.Focus()
+			m.table.Blur()
+			return m, nil
 
 		case msg.Type == tea.KeyEsc && m.state == stateRunning:
 			if m.cancelFn != nil {
@@ -299,17 +310,18 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 
 		default:
-			if m.state == stateReady && !m.editor.Focused() {
+			if m.state == stateReady && (m.showHints || !m.editor.Focused()) {
 				// a–d load a suggestion from the expanded index
 				if idx := letterKey(msg.String()); idx >= 0 && idx < len(m.hintSuggestions) {
 					m.editor.SetValue(m.hintSuggestions[idx].query)
 					m.editor.CursorEnd()
 					m.editor.Focus()
 					m.table.Blur()
+					m.showHints = false
 					return m, nil
 				}
 			}
-			if m.state == stateReady && m.editor.Focused() && strings.TrimSpace(m.editor.Value()) == "" {
+			if m.state == stateReady && (m.showHints || (m.editor.Focused() && strings.TrimSpace(m.editor.Value()) == "")) {
 				if idx := digitKey(msg.String()); idx >= 1 && idx <= len(m.hints) {
 					h := m.hints[idx-1]
 					m.selectedHintIndex = idx - 1
@@ -317,6 +329,9 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					q := hintQuery(h.Index)
 					m.editor.SetValue(q)
 					m.editor.CursorEnd()
+					m.editor.Focus()
+					m.table.Blur()
+					m.showHints = false
 					return m, nil
 				}
 			}
@@ -341,7 +356,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case messages.HintsMsg:
 		if msg.Err == nil {
 			m.hints = msg.Hints
-			// fire field discovery for every hinted index concurrently
+			m.showHints = true
 			cmds := make([]tea.Cmd, len(msg.Hints))
 			for i, h := range msg.Hints {
 				cmds[i] = discoverFields(context.Background(), m.client, h.Index)
@@ -721,7 +736,7 @@ func (m *Model) View() string {
 	default:
 		if m.err != nil {
 			body = "\n  " + m.styles.errorText.Render(m.err.Error()) + "\n" + m.table.View()
-		} else if m.rowCount == 0 && len(m.hints) > 0 {
+		} else if m.showHints && len(m.hints) > 0 {
 			body = m.hintsView()
 		} else if m.viewMode == viewModeRecord {
 			body = m.record.View()
@@ -735,7 +750,7 @@ func (m *Model) View() string {
 
 func (m *Model) hintsView() string {
 	var sb strings.Builder
-	sb.WriteString(m.styles.hintHeader.Render("Active indices — last 15 minutes (press 1–9 to load)"))
+	sb.WriteString(m.styles.hintHeader.Render(fmt.Sprintf("Active indices — last %dm  (1–9: load query  a–d: load suggestion  Esc: close)", timePresets[m.timeIdx])))
 	sb.WriteByte('\n')
 	for i, h := range m.hints {
 		label := fmt.Sprintf("  [%d] %-55s %s events", i+1, h.Index, h.Count)
@@ -797,7 +812,7 @@ func (m *Model) statusLine() string {
 		hint += "  Enter: WHERE  Ctrl+K: KEEP  n/p: next/prev  Esc: back"
 		parts = append(parts, hint)
 	} else {
-		parts = append(parts, "Ctrl+R: run  Tab: focus  Enter/v: record view  Ctrl+C: quit")
+		parts = append(parts, "Ctrl+R: run  Ctrl+H: hints  Tab: focus  Enter/v: record  Ctrl+C: quit")
 	}
 
 	return m.styles.statusBar.Width(m.width).Render(strings.Join(parts, "  │  "))
